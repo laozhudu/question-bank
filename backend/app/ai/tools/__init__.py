@@ -8,6 +8,13 @@ from app.ai.tools.registry import (
     tools_for,
 )
 
-from app.ai.tools import client, composition_edit, compositions, library, questions  # noqa: E402,F401
+from app.ai.tools import (  # noqa: E402,F401
+    agent_workbench,
+    client,
+    composition_edit,
+    compositions,
+    library,
+    questions,
+)
 
 __all__ = ["all_tools", "dispatch", "get", "openai_schemas", "register", "tools_for"]

@@ -15,7 +15,7 @@ from app.core.config import get_db_url, is_configured
 from app.core.file_paths import task_source_file
 from app.models.import_task import ImportTask, ImportTaskStatus
 from app.models.user import User
-from app.services import data_migrations
+from app.services import agent_jobs, data_migrations
 from app.services.doc_processor import doc_processor
 from app.services.embedding import reload_embedding_function
 from app.services.paper_import_service import commit_extracted_paper_import
@@ -186,6 +186,10 @@ async def worker():
                     await process_task(db, task)
                 else:
                     await db.commit()
+                    # 做题工作台的任务队列（docs/development/agent-workbench.md）。
+                    # 与 import_tasks 同进程轮询：单机个人用没必要再起一个 worker 进程。
+                    if await agent_jobs.run_once(db, use_row_lock=use_row_lock):
+                        continue
                     await asyncio.sleep(10)
             except Exception as e:
                 logger.error(f"Worker loop error: {e}")

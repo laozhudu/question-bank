@@ -29,6 +29,12 @@ class AgentRun(Base):
     subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=True)
     surface = Column(String(16), nullable=False)
     status = Column(String(24), nullable=False, default=AgentRunStatus.RUNNING)
+    # 做题工作台的角色：solver | reviewer | judge | decomposer | composer | gate。
+    # 与 surface（从哪个入口进来）正交：surface 是审计语义，role 是「这一轮在扮演谁」。
+    role = Column(String(24), nullable=True, index=True)
+    # 这一轮「模型看到了什么」的指纹。盲复核要靠它复现：票与 packet 必须对得上。
+    packet_hash = Column(String(64), nullable=True, index=True)
+    question_id = Column(Integer, ForeignKey("questions.id", ondelete="SET NULL"), nullable=True, index=True)
     model_id = Column(
         Integer, ForeignKey("ai_models.id", ondelete="SET NULL"), nullable=True
     )

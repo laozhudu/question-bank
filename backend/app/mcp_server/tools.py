@@ -84,6 +84,7 @@ CAPABILITY_OUTPUT_TYPES: Dict[str, Any] = {
     "composition.finalize_version": CompositionVersionRead,
     "knowledge_point.create": schemas.KnowledgePoint,
     "tag.create": schemas.Tag,
+    "agent.queue_job": dict,
 }
 
 _PROVIDED_SUFFIX = "_provided"

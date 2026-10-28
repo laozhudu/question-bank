@@ -71,6 +71,9 @@ def test_registry_exposes_the_expected_tools():
         "edit_composition",
         "open_composition",
         "open_page",
+        # 做题工作台（docs/development/agent-workbench.md）
+        "queue_agent_job",
+        "get_agent_job",
     }
 
 

@@ -19,6 +19,8 @@ from .subject_setting import SubjectSetting
 from .ai_config import AIProvider, AIModel, UserAIPreference
 from .chat import ChatSession, ChatMessage
 from .agent import AgentRun, AgentStep
+from .agent_job import AgentJob, AgentJobKind, AgentJobStatus
+from .solve_attempt import SolveAttempt, SolveAttemptStatus
 from .prompt import PromptTemplate
 from .paper import Paper, PaperQuestion
 from .composition import (
