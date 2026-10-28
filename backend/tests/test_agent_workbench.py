@@ -168,9 +168,15 @@ async def test_viewer_cannot_queue(db_session, seed):
 # 执行
 # --------------------------------------------------------------------------- #
 async def test_missing_handler_goes_dead_not_silently_done(db_session, seed):
-    await _queue(db_session, seed, payload={"round": 1})
-
-    assert await agent_jobs.run_once(db_session) is True
+    # solve 已经有真处理器了（services/solve_handler.py）；这里临时摘掉，
+    # 验的是「没有处理器时必须死信，而不是记成 done」。
+    saved = agent_jobs._HANDLERS.pop(AgentJobKind.SOLVE.value, None)
+    try:
+        await _queue(db_session, seed, payload={"round": 1})
+        assert await agent_jobs.run_once(db_session) is True
+    finally:
+        if saved is not None:
+            agent_jobs._HANDLERS[AgentJobKind.SOLVE.value] = saved
 
     job = (await _jobs(db_session))[0]
     assert job.status == AgentJobStatus.DEAD.value

@@ -15,7 +15,7 @@ from app.core.config import get_db_url, is_configured
 from app.core.file_paths import task_source_file
 from app.models.import_task import ImportTask, ImportTaskStatus
 from app.models.user import User
-from app.services import agent_jobs, data_migrations
+from app.services import agent_jobs, data_migrations, solve_handler  # noqa: F401  注册 solve 处理器
 from app.services.doc_processor import doc_processor
 from app.services.embedding import reload_embedding_function
 from app.services.paper_import_service import commit_extracted_paper_import
