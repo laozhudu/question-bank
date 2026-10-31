@@ -45,11 +45,33 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_mode_solve_falls_back():
+def test_mode_solve_uses_solve_path(monkeypatch):
+    """solve 走两阶段的分批求解，不再降级到整篇 AIExtractor。"""
     ex = _extractor()
-    _run(ex.extract(_plain_doc(MIN_Q + 5), db=None, mode="solve"))
-    assert ex._fallback.calls == 1
-    assert ex._fallback.last_kwargs["mode"] == "solve"
+    seen = {}
+
+    async def fake_resolve(db, is_vision=False, user_id=None):
+        return "openai", {}
+
+    async def fake_solve(segments, config):
+        seen["n"] = len(segments)
+        return [
+            {"ord": i, "answer": "B", "thinking": "思路", "analysis": "解析", "summary": "小结"}
+            for i in range(1, len(segments) + 1)
+        ]
+
+    monkeypatch.setattr(
+        "app.services.importing.provider_config.resolve_active_provider", fake_resolve
+    )
+    monkeypatch.setattr(ex, "_ask_solutions_batched", fake_solve)
+    monkeypatch.setattr(two_phase, "get_ai_provider", lambda name: object())
+
+    result = _run(ex.extract(_plain_doc(MIN_Q + 5), db=None, mode="solve"))
+    assert ex._fallback.calls == 0
+    assert seen["n"] == MIN_Q + 5
+    assert len(result.questions) == MIN_Q + 5
+    # 题干来自原文，AI 只补答案与解析
+    assert all(q["analysis"] for q in result.questions)
 
 
 def test_image_input_falls_back():
@@ -152,3 +174,43 @@ def test_ord_complete_does_not_fall_back(monkeypatch):
 )
 def test_option_contiguity_required(block, expected):
     assert len(_options_to_list(block)) == expected
+
+
+# --------------------------------------------------------------------------- #
+# 表格内题目展开：教辅的"方法归纳"表把练习塞在单元格里，题号不在行首
+# --------------------------------------------------------------------------- #
+def test_table_items_are_extracted():
+    """单元格里的成套练习要拆成独立题；分类标签跟着题走，不能丢。"""
+    blank = "\\_\\_\\_"
+    md = (
+        "1. 例题: 已知 x 为常数，求该方程所有实数根的和.\n"
+        "| 类型一 完全平方式 <br> 例题讲解 | 1. 若关于 x 的多项式是完全平方式，则 m 的值为"
+        + blank + " ； <br> 2. 若关于 y 的多项式是一个完全平方式，求 n 的值. |\n"
+        "| --- | --- |\n"
+    )
+    out, cnt = two_phase.expand_table_items(md)
+    assert cnt == 2, out
+    assert "1. 若关于 x 的多项式是完全平方式" in out
+    assert "2. 若关于 y 的多项式是一个完全平方式" in out
+    assert "类型一 完全平方式" in out          # 分类标签没丢
+
+
+def test_data_table_is_preserved():
+    """纯数据表（点数表、函数值表）不能被拆，否则题目写着"观察表格"却没有表。"""
+    md = (
+        "1. 观察表格:\n"
+        "| x | -2 | -1 | 0 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| y | 4 | 1 | 0 |\n"
+    )
+    out, cnt = two_phase.expand_table_items(md)
+    assert cnt == 0
+    assert "| --- | --- | --- | --- |" in out
+    assert out.count("|") >= md.count("|")
+
+
+def test_separator_row_is_kept():
+    """分隔行必须保留：下游靠它区分完整表格和被切断的残块。"""
+    md = "1. 题干\n| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+    out, _ = two_phase.expand_table_items(md)
+    assert "| --- | --- |" in out

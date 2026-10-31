@@ -183,6 +183,152 @@ def _looks_like_paper(markdown: str) -> bool:
 # 括号型题号（1） / 1)）：在解析区里通常是步骤编号，不当成新题
 PAREN_NUM_RE = re.compile(r"^\s*\d{1,3}\s*[)）]\s*")
 
+# --------------------------------------------------------------------------- #
+# 表格内题目展开
+#
+# 教辅的"方法归纳"表格常把配套练习塞进单元格，用 <br> 分隔：
+#   | 类型一 完全平方式 1. … 2. … | 1. 若关于 x 的多项式… 2. 若…求… 的值 |
+# 这些题号不是行首，NUM_RE 永远匹配不到，于是整张表跟着上一个题号走，
+# 变成一道几千字符的"题"。实测一份 415 段的材料里，4 道题的题干内藏了
+# 54 道独立题目（最长题干 6,675 字符，89% 是表格）。
+#
+# 处理方式：把命中的单元格片段从表格里摘出来，按原位置紧跟表格输出为独立
+# 段落；表格剩余部分（方法、图、公式）留在原处。不改变原文措辞。
+# --------------------------------------------------------------------------- #
+# 折行的表格行不以 `|` 结尾（OCR/导出常见），只要求以 `|` 开头
+TABLE_ROW_RE = re.compile(r"^\s*\|")
+
+# 片段起点：题号 / 教材母题 / 教材变式 / 练透 / 类型X / 【标签】
+ITEM_START_RE = re.compile(
+    r"^\s*(?:\d{1,3}\s*[.．、]|【[^】]{1,12}】|教材母题|教材变式|练透\s*\d+|类型[一二三四五六七八九十]+)"
+)
+
+# 片段必须像一道题：有空位、有提问动词，且不是纯标题
+ITEM_ASK_RE = re.compile(
+    r"\\_\\_\\_|___|＿{2,}|（\s*）|\(\s*\)|求证|求|解方程|解不等式|取值范围|大小关系|画出|证明|说明理由|填写"
+)
+
+
+def _looks_like_table_item(fragment: str) -> bool:
+    """单元格里的一段文字是否构成一道独立题目。"""
+    text = fragment.strip()
+    if len(text) < 20:
+        return False
+    if not ITEM_START_RE.match(text):
+        return False
+    # "类型一 完全平方式" 这类纯标题不算题
+    if not ITEM_ASK_RE.search(text):
+        return False
+    return True
+
+
+def expand_table_items(markdown: str) -> Tuple[str, int]:
+    """把表格单元格里被 <br> 分隔的题目摘出来，按原位置输出为独立段。
+
+    返回 (改写后的 markdown, 摘出的题目数)。
+
+    设计要点（都是踩过的坑）：
+    1. 单元格里的分类标签（"类型一 完全平方式"、"类型四 线段和最值——将军饮马"）
+       必须跟着它下面的题目一起走，否则会像以前那样被静默丢掉。
+    2. 摘走题目后变空的行要整行删除，否则会在题干里留下 `|  |  |` 噪声，而且
+       残留的空表会让 `_split_trailing_table` 把真正的题目数据表误判成"尾表"
+       剥进解析（实测导致题干里的表格字符全变成 0，题目写着"观察表格"却没有表）。
+    3. 数据表（点数表、函数值表）里没有 `<br>` 分隔的题目，原样保留。
+    """
+    lines = markdown.split("\n")
+    out: List[str] = []
+    pending: List[Tuple[str, str]] = []   # (分类标签, 题目文本)
+    in_table = False
+    extracted_total = 0
+
+    def flush_items() -> None:
+        nonlocal pending, extracted_total
+        if not pending:
+            return
+        extracted_total += len(pending)
+        out.append("")
+        for idx, (label, item) in enumerate(pending, start=1):
+            text = item.strip()
+            if label:
+                text = "%s（%s）" % (text, label)
+            if not re.match(r"^\s*\d{1,3}\s*[.．、]", text):
+                text = "%d. %s" % (idx, text)
+            out.append(text)
+        out.append("")
+        pending = []
+
+    for line in lines:
+        if not TABLE_ROW_RE.match(line):
+            if in_table:
+                in_table = False
+                flush_items()
+            out.append(line)
+            continue
+
+        in_table = True
+        # 分隔行（| --- | --- |）必须原样保留：下游用"有没有分隔行"来判断一个表
+        # 是完整表格还是被切断的残块，删掉它会让完整表格被当成残块剥进解析。
+        if re.match(r"^\s*\|[\s:\-|]*\|\s*$", line):
+            out.append(line)
+            continue
+
+        cells = line.split("|")
+        new_cells: List[str] = []
+        row_label = ""
+        row_items: List[str] = []
+        for cell in cells:
+            parts = cell.split("<br>")
+            keep: List[str] = []
+            for part in parts:
+                text = part.strip()
+                if _looks_like_table_item(text):
+                    row_items.append(text)
+                elif text and ITEM_START_RE.match(text) and len(text) <= 30:
+                    # 分类标题，挂到本行的题目上
+                    row_label = (row_label + " " + text).strip() if row_label else text
+                else:
+                    keep.append(part)
+            new_cells.append("<br>".join(keep))
+
+        if row_items:
+            for it in row_items:
+                pending.append((row_label, it))
+            # 剩下的若不是空壳就保留（可能是例题讲解、图）
+            joined = "|".join(new_cells)
+            rest = joined.replace("|", "").replace("-", "").replace("<br>", "").strip()
+            if rest:
+                out.append(joined)
+        else:
+            out.append(line)
+
+    if in_table:
+        flush_items()
+
+    # 收尾：题目被摘走后可能只剩分隔行/空壳的表格块，整块丢掉。
+    # 留着会在题干里变成一行 `| --- | --- |`，然后被下游当成"表格残块"剥走。
+    cleaned: List[str] = []
+    block: List[str] = []
+
+    def flush_block() -> None:
+        if not block:
+            return
+        has_content = any(
+            re.sub(r"[\s|:\-]", "", ln) for ln in block
+        )
+        if has_content:
+            cleaned.extend(block)
+        block.clear()
+
+    for line in out:
+        if TABLE_ROW_RE.match(line):
+            block.append(line)
+        else:
+            flush_block()
+            cleaned.append(line)
+    flush_block()
+
+    return "\n".join(cleaned), extracted_total
+
 
 def split_segments(markdown: str) -> List[List[str]]:
     """按行首题号把整篇原文切成若干题的原始行块（保留原行，便于后续逐字取用）。
@@ -737,7 +883,13 @@ class TwoPhaseExtractor:
                 subject_id=subject_id, user_id=user_id,
             )
 
-        segments = split_segments(content)
+        # 表格单元格里常塞着成套练习（"方法归纳"表），题号不在行首，切段器看不到。
+        # 先摘出来变成独立段，否则它们会整体并进上一题的题干（实测 4 道题吞掉 54 道）。
+        expanded, extracted_n = expand_table_items(content)
+        if extracted_n:
+            logger.info("two-phase: expanded %d questions embedded in tables", extracted_n)
+
+        segments = split_segments(expanded)
         if len(segments) < MIN_Q:
             logger.info(
                 "two-phase skipped: %d segments < MIN_Q(%d), falling back",
