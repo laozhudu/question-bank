@@ -30,6 +30,18 @@
   而原文有 148 个带选项块的题）
 - 图片引用原样保留
 
+阶段 1 有两种模式（提示词不同，其余共用）：
+
+- `extract`：AI 只提取原文**已有**答案，没有就留空。绝不自己解题——自己算出来的
+  答案一旦有错就会被当成原文答案入库。
+- `solve`：AI 逐题求解，产出 answer/thinking/analysis/summary/difficulty。
+  **分批**（每批 `SOLVE_BATCH_SIZE` 题）：实测整篇一次调用给 139 张图、56 个页码
+  的教辅只出 16 题，内容停在第一章；单题「答案+思路+详解+小结」约 4,000 字符，
+  模型写完十几题就 stop，后面整章静默消失，而任务状态仍是 completed。
+
+两种模式的共同点：**题干永远从原文切**，所以题干不可能被改写，原文里的图片占位符
+也不会像 AI 回写时那样被整批丢掉（实测一次丢 139/139）。
+
 降级：题数少于 `MIN_Q`、或 AI 调用失败、或 AI 返回条目数与切段数不符时，
 退回原始 `AIExtractor`，行为与未打补丁时一致。
 """
@@ -59,6 +71,11 @@ RETRY_DELAYS = (0, 20, 60)
 # 答案阶段每批题数。实测单次 227K token 的整本请求上游会概率性 502，
 # 拆成每批 150 题（约 40K token）后稳定；对外仍是一次导入，不需要用户干预。
 BATCH_SIZE = 100000  # 不分批：整本一次调用（用户要求，上游限制靠切 cn: 前缀解决）
+
+# solve 阶段每批题数。单题「答案+思路+详解+小结」实测约 4,000 字符；一次调用只给
+# 6 题（约 24K 字符输出）留足余量。整篇一次调用实测只出 16 题：不是上下文不够，
+# 是输出体积撞上限，且模型是把前几题写满后 stop，后面整章静默消失。
+SOLVE_BATCH_SIZE = 6
 
 # 行首题号：1. / 1． / 1、 / 1) / 1）
 # 必须排除小数（3.14 不是第 3 题）：点号后不能紧跟数字。
@@ -117,6 +134,33 @@ USER_PROMPT = """## 关键前提
 {{"items":[{{"ord":1,"answer":"A"}},{{"ord":2,"answer":""}}]}}
 
 ## 原文
+"""
+
+SOLVE_SYS_PROMPT = (
+    "你是资深数学教师，负责逐题求解。只输出 JSON，不要 code fence，"
+    "不要输出题干原文。"
+)
+
+SOLVE_USER_PROMPT = r"""## 关键前提
+下面是从教辅书里按出现顺序切出的 {n} 道题，每题以 `### [i]` 开头。
+题干、选项、图片占位符都由系统另行从原文取，**你不需要回写题干**。
+
+## 任务
+逐题求解，产出：答案、思路、详解、小结、难度。
+
+## 硬性要求
+1. 输出正好 {n} 项，`ord` 必须与 `### [i]` 的编号一致；不许重排、合并或跳过。
+2. **不要输出题干**，也不要重复题目原文里的句子。
+3. 答案只写最终结果：选择题写字母（多选如 `ABD`），填空题每个空一个表达式，
+   解答题写完整结论。
+4. 公式一律 LaTeX：行内 `$...$`，分式优先 `\dfrac`。
+   反斜杠只写一个，例如 `$\sqrt{2}$`、`$\dfrac{1}{2}$`。
+5. 原文若自带解析，可以参考但必须自己验算；与原文冲突时以验算结果为准。
+
+## 输出格式
+{"items":[{"ord":1,"answer":"A","thinking":"...","analysis":"...","summary":"..."}]}
+
+## 题目
 """
 
 
@@ -412,14 +456,34 @@ def _infer_difficulty(stem: str, options: List[str], q_type: str) -> int:
     return max(1, min(5, score))
 
 
+def _clamp_difficulty(value: Any, fallback: int) -> int:
+    """难度只接受 1–5：前端星级与筛选按 1–5 硬编码，越界值会显示异常或筛不出来。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if v < 1 or v > 5:
+        logger.warning("difficulty out of range (%s), clamped", v)
+        return min(max(v, 1), 5)
+    return v
+
+
 def build_questions(
-    segments: List[List[str]], ai_items: List[Dict[str, Any]]
+    segments: List[List[str]],
+    ai_items: List[Dict[str, Any]],
+    *,
+    solve: bool = False,
 ) -> List[Dict[str, Any]]:
-    """把切段 + AI 答案组装成 legacy 形态的题目 dict（喂给 adapt_legacy_question）。"""
-    by_ord: Dict[int, str] = {}
+    """把切段 + AI 结果组装成 legacy 形态的题目 dict（喂给 adapt_legacy_question）。
+
+    solve=False：AI 只给 answer，解析从小节原文里切。
+    solve=True：AI 给 answer + thinking/analysis/summary/difficulty，解析优先用 AI 的
+    （原文解析作为兜底），题干仍然逐字来自原文，因此不可能被改写、图片占位符也不会丢。
+    """
+    by_ord: Dict[int, Dict[str, Any]] = {}
     for item in ai_items:
         try:
-            by_ord[int(item.get("ord"))] = (item.get("answer") or "").strip()
+            by_ord[int(item.get("ord"))] = item
         except (TypeError, ValueError):
             continue
 
@@ -437,8 +501,10 @@ def build_questions(
             analysis = (analysis + "\n\n" + table_tail).strip() if analysis else table_tail
         stem, script_answer = _strip_inline_answer(stem)
 
-        ai_answer = by_ord.get(idx, "")
-        # 脚本剥出的答案优先（确定性），AI 只补脚本剥不到的
+        ai_item = by_ord.get(idx) or {}
+        ai_answer = (ai_item.get("answer") or "").strip()
+        # 脚本剥出的答案优先（确定性），AI 只补脚本剥不到的；
+        # solve 模式下原文没有答案，AI 的答案就是唯一来源。
         answer = script_answer or ai_answer
         q_type = _infer_q_type(stem, options, answer)
         difficulty = _infer_difficulty(stem, options, q_type)
@@ -453,14 +519,28 @@ def build_questions(
             ]
         answer_value = _sanitize_answer(q_type, answer, options)
 
+        thinking = ""
+        summary = ""
+        if solve:
+            thinking = _upgrade_frac((ai_item.get("thinking") or "").strip())
+            summary = _upgrade_frac((ai_item.get("summary") or "").strip())
+            ai_analysis = _upgrade_frac((ai_item.get("analysis") or "").strip())
+            # 原文解析兜底，AI 解析优先：AI 是真正算过的那份
+            analysis = ai_analysis or analysis
+            # 难度**不**采用模型给的值：1.6.0 的两套提示词都让模型给 1–5，却没有给任何
+            # 判据。实测 12 题全部落在 1–2（[2,1,1,2,1,2,1,2,2,2,2,2]），等于没有区分度，
+            # 而越界值（实测出现过 6/7/8）会让前端星级和筛选失效。
+            # 改用脚本按题干特征估计，并强制夹到 1–5。
+            difficulty = _clamp_difficulty(difficulty, difficulty)
+
         questions.append(
             {
                 "content": stem,
                 "options": options,
                 "answer": answer_value,
-                "thinking": "",
+                "thinking": thinking,
                 "analysis": _upgrade_frac(analysis),
-                "summary": "",
+                "summary": summary,
                 "difficulty": difficulty,
                 "q_type": q_type,
             }
@@ -469,7 +549,7 @@ def build_questions(
 
 
 class TwoPhaseExtractor:
-    """整篇一次投：AI 判答案，脚本切题干。见模块 docstring 的实测依据。"""
+    """AI 只负责答案/解析，题干由脚本从原文切。见模块 docstring 的实测依据。"""
 
     def __init__(self, enricher: Optional[KnowledgePointEnricher] = None) -> None:
         self.enricher = enricher or KnowledgePointEnricher()
@@ -500,6 +580,80 @@ class TwoPhaseExtractor:
                 start + 1, min(start + BATCH_SIZE, total), total, len(items),
             )
         return collected
+
+    async def _ask_solutions_batched(
+        self, segments: List[List[str]], config: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """分小批逐题求解，返回带全局 ord 的结果。
+
+        为什么必须分批：整篇一次调用实测 139 张图 / 56 个页码的教辅只出 16 题，
+        内容停在第一章——单题输出（答案+思路+详解+小结）约 4,000 字符，模型写完
+        十几题就 stop，后面整章静默消失，而调用方看到的是 completed。
+        """
+        collected: List[Dict[str, Any]] = []
+        total = len(segments)
+        for start in range(0, total, SOLVE_BATCH_SIZE):
+            batch = segments[start : start + SOLVE_BATCH_SIZE]
+            text = "\n\n".join(
+                "### [%d]\n%s" % (i + 1, "\n".join(block).strip())
+                for i, block in enumerate(batch)
+            )
+            items = await self._ask_solutions(text, config, len(batch))
+            for item in items:
+                try:
+                    item["ord"] = int(item.get("ord")) + start
+                except (TypeError, ValueError):
+                    continue
+            collected.extend(items)
+            logger.info(
+                "two-phase solve batch %d-%d/%d solved (%d items)",
+                start + 1, min(start + SOLVE_BATCH_SIZE, total), total, len(items),
+            )
+        return collected
+
+    async def _ask_solutions(
+        self, content: str, config: Dict[str, Any], n: int
+    ) -> List[Dict[str, Any]]:
+        """单批求解。批次小，重试代价低，但仍保留退避以对付上游偶发 502。"""
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            api_key=config.get("API_KEY"), base_url=config.get("BASE_URL")
+        )
+        messages = [
+            {"role": "system", "content": SOLVE_SYS_PROMPT},
+            # 不能用 .format()：提示词里的 LaTeX（\dfrac{1}{2}）会被当成位置占位符。
+            {"role": "user", "content": SOLVE_USER_PROMPT.replace("{n}", str(n)) + content},
+        ]
+
+        last_error: Exception | None = None
+        for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+            try:
+                response = await client.chat.completions.create(
+                    model=config.get("MODEL_NAME", "gpt-4o"),
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=65536,
+                )
+                choice = response.choices[0]
+                if choice.finish_reason == "length":
+                    raise RuntimeError("solve phase truncated (finish_reason=length)")
+                payload = json.loads(choice.message.content or "")
+                items = payload.get("items") or []
+                if not items:
+                    raise RuntimeError("solve phase returned empty items")
+                return items
+            except Exception as exc:  # noqa: BLE001 - 重试后再决定是否失败
+                last_error = exc
+                logger.warning(
+                    "two-phase solve attempt %d/%d failed: %s",
+                    attempt, len(RETRY_DELAYS), exc,
+                )
+                if attempt < len(RETRY_DELAYS):
+                    await asyncio.sleep(delay)
+        raise RuntimeError(
+            f"solve phase failed after {len(RETRY_DELAYS)} attempts: {last_error}"
+        )
 
     async def _ask_answers(
         self, content: str, config: Dict[str, Any], n: int
@@ -564,10 +718,12 @@ class TwoPhaseExtractor:
                 mode=mode, subject_id=subject_id, user_id=user_id,
             )
 
-        # mode=solve 要求 AI 自己做题并产出 thinking/analysis，两阶段会把它置空，
-        # 所以只服务 mode=extract（只抽原文已有答案）。
-        if mode != "extract":
-            logger.info("two-phase skipped: mode=%s not 'extract'", mode)
+        # 两种模式都走两阶段，但提示词不同：
+        #   extract → AI 只提取原文已有答案，没有就留空（绝不自己解题）
+        #   solve   → AI 逐题求解，产出 answer/thinking/analysis/summary/difficulty
+        # 共同点是题干永远从原文切，所以不可能被改写、图片占位符也不会丢。
+        if mode not in ("extract", "solve"):
+            logger.info("two-phase skipped: unsupported mode=%s", mode)
             return await self._fallback_extract(
                 content, db, filename=filename, mode=mode,
                 subject_id=subject_id, user_id=user_id,
@@ -607,7 +763,11 @@ class TwoPhaseExtractor:
         # 注意：这里刻意不降级到 AIExtractor。实测整本 227K token 的请求失败后，
         # 单次全量抽取只会再失败一次（模型只吐十几题就 stop），产出的残缺数据
         # 更难察觉。让异常抛出去，任务显式失败，重试一次就好。
-        ai_items = await self._ask_answers_batched(segments, config)
+        solve_mode = mode == "solve"
+        if solve_mode:
+            ai_items = await self._ask_solutions_batched(segments, config)
+        else:
+            ai_items = await self._ask_answers_batched(segments, config)
 
         # 校验：条数必须与切段数一致，且 ord 必须是 1..N 的连续排列。
         # 漏一条会让后面所有答案按 ord 对齐时整体错位，比降级更危险。
@@ -627,9 +787,12 @@ class TwoPhaseExtractor:
                 subject_id=subject_id, user_id=user_id,
             )
 
-        logger.info("two-phase: %d segments, AI answered all in order", len(segments))
+        logger.info(
+            "two-phase: %d segments, AI %s all in order",
+            len(segments), "solved" if solve_mode else "answered",
+        )
 
-        questions = build_questions(segments, ai_items)
+        questions = build_questions(segments, ai_items, solve=solve_mode)
         if not questions:
             return ExtractionResult()
 
